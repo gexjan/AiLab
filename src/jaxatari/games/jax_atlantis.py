@@ -15,6 +15,7 @@ from jaxatari.rendering import atraJaxis as aj
 from jaxatari.renderers import AtraJaxisRenderer
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 
+from jax import debug  # TODO Remove Debug import later
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -78,7 +79,7 @@ class AtlantisState(NamedTuple):
     lanes_free: chex.Array # bool for each lane
     command_post_alive: chex.Array # is command post alive (middle cannon)
     #installations: chex.Array # should store all current installations and their coordinates
-
+    plasma_x: chex.Array # X position of the plasma. Y position is actually not that relevant
 
 class AtlantisObservation(NamedTuple):
     score: jnp.ndarray
@@ -192,6 +193,36 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
 
         raster = jax.lax.fori_loop(0, cfg.max_enemies, _draw_enemy, raster)
 
+        # TODO After a tower or canon is hit, the plasma should be switched off until the enemy reaches end of the screen.
+
+        def _handle_plasma_logic(i, ras):
+            # Plasma beam logic
+            plasma_color = (0, 255, 255)  # cyan
+            beam_pixel = _solid_sprite(1, 1, plasma_color)
+            plasma_height = cfg.cannon_y
+
+            # only for the one enemy in lane 3 (4th lane) and active
+            on_lane4 = (state.enemies[i, 4] == 3) & (state.enemies[i, 5] == 1)
+            ex       = state.enemies[i, 0].astype(jnp.int32) + cfg.enemy_width/2
+            ey       = state.enemies[i, 1].astype(jnp.int32)
+            start_y  = ey + cfg.enemy_height
+
+            # draw vertical line pixel-by-pixel
+            def _draw_row(y, r):
+                return jax.lax.cond(
+                  on_lane4 & (y >= start_y),
+                  lambda rr: aj.render_at(rr, ex, y, beam_pixel),
+                  lambda rr: rr,
+                  r,
+                )
+
+            # loop y=0…screen_h−1
+            return jax.lax.fori_loop(0, plasma_height, _draw_row, ras)
+
+        # apply to every enemy slot (only one will actually fire)
+        raster = jax.lax.fori_loop(0, cfg.max_enemies, _handle_plasma_logic, raster)
+        # ————————————————————————————————
+
         return raster
 
 
@@ -249,6 +280,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             rng=key,
             lanes_free=empty_lanes,
             command_post_alive=jnp.array(True, dtype=jnp.bool_),
+            plasma_x=jnp.array(-1, dtype=jnp.int32)
         )
 
         obs = self._get_observation(new_state)
@@ -601,6 +633,25 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
         return state._replace(bullets_alive=new_bullet_alive, enemies=enemies_updated)
 
+    # TODO Currently, the collision logic with plasma is not implemented. We only have the X position of the Plasma
+    # at this stage which will be compared with the X position of tower / enemy to detect collision.
+    # TODO Plasma is shot only by enemy at fourth lane. Make sure this assumption holds in higher waves as well !
+    @partial(jax.jit, static_argnums=(0,))
+    def _update_plasma_x_position(self, state: AtlantisState) -> AtlantisState:
+        lane4 = (state.enemies[:, 4] == 3) & (state.enemies[:, 5] == 1)
+        # compute each candidate beam-X (center of enemy)
+        ex = state.enemies[:, 0] + (self.config.enemy_width // 2)
+        # select beam-X for lane4 enemies, else -1
+        beam_xs = jnp.where(lane4, ex, -1)
+        # pick the max (will be -1 if no such enemy)
+        plasma_x = jnp.max(beam_xs)
+        # save into the state
+
+        # Todo remove debug statement after collision logic implemented
+        #debug.print("[DEBUG] plasma_x = {px}", px=plasma_x)
+
+        return state._replace(plasma_x=plasma_x)
+
     @partial(jax.jit, static_argnums=(0,))
     def step(
         self, state: AtlantisState, action: chex.Array
@@ -622,6 +673,8 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         state = self._move_enemies(state)
 
         state = self._check_bullet_enemy_collision(state)
+
+        state = self._update_plasma_x_position(state)
 
         observation = self._get_observation(state)
         info = AtlantisInfo(time=jnp.array(0, dtype=jnp.int32))
