@@ -30,14 +30,16 @@ class GameConfig:
     cannon_height: int = 8
     cannon_width: int = 8
     cannon_y: int = 160
-    # Use plain python sequences and only convert them to JAX arrays inside the jitted code
-    cannon_x: Tuple[int, int, int] = (0, 72, 152)
+    cannon_x: jnp.ndarray = field(
+        default_factory=lambda: jnp.array([0,72,152], dtype=jnp.int32)
+    )
     max_bullets: int = 2
     max_enemies: int = 20  # max 1 per line
     fire_cooldown_frames: int = 9  # delay between shots
     # y-coordinates of the different enemy paths/heights
-    # Use plain python sequences and only convert them to JAX arrays inside the jitted code
-    enemy_paths: Tuple[int,int,int,int] = (60, 80, 100, 120)
+    enemy_paths: jnp.ndarray = field(
+        default_factory=lambda: jnp.array([60, 80, 100, 120], dtype=jnp.int32)
+    )
     enemy_width: int = 15 # 3 different lengths 15, 16, 9
     enemy_height: int = 8
     enemy_speed: int = 1 # changes throughout the game
@@ -159,7 +161,7 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
         @partial(jax.jit, static_argnums=(0,))
         def _draw_cannon(i, ras):
             alive = state.cannons_alive[i]
-            x0 = jnp.array(cfg.cannon_x, dtype=jnp.int32)[i]
+            x0 = cfg.cannon_x[i]
             y0 = cfg.cannon_y
 
             def _blit(r):
@@ -167,7 +169,7 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
 
             return jax.lax.cond(alive, _blit, lambda r: r, ras)
 
-        raster = jax.lax.fori_loop(0, jnp.array(cfg.cannon_x, dtype=jnp.int32).shape[0], _draw_cannon, raster)
+        raster = jax.lax.fori_loop(0, cfg.cannon_x.shape[0], _draw_cannon, raster)
 
         # add solid white cannons
         bullet_sprite = _solid_sprite(
@@ -366,7 +368,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             dy = jnp.where(jnp.logical_or(cannon_idx == 0, cannon_idx==2), -(cfg.bullet_speed-1), -cfg.bullet_speed)
 
             new_bullet = jnp.array(
-                [jnp.array(cfg.cannon_x, dtype=jnp.int32)[cannon_idx], cfg.cannon_y, dx, dy],  # velocity
+                [cfg.cannon_x[cannon_idx], cfg.cannon_y, dx, dy],  # velocity
                 dtype=jnp.int32,
             )
 
@@ -486,7 +488,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
             # Choose a lane (rows in cfg.enemy_paths) and a direction.
             lane_idx = 0
-            lane_y = jnp.array(cfg.enemy_paths, dtype=jnp.int32)[lane_idx]
+            lane_y = cfg.enemy_paths[lane_idx]
 
             # randomy decide the direction of the enemies, left or right
             go_left = jax.random.bernoulli(rng_spawn)  # True == left
@@ -548,7 +550,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         dx_vel = enemies[:, 2]
         lane_indices = enemies[:, 4] # get current lanes of all enemies
         is_active = enemies[:, 5] == 1 # get active flags of all enemies
-        number_lanes = jnp.array(cfg.enemy_paths, dtype=jnp.int32).shape[0]
+        number_lanes = cfg.enemy_paths.shape[0]
 
         # y always stays constant. just move x by adding dx
         new_pos = x_pos + dx_vel  # x + dx
@@ -620,7 +622,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         # Get the corresponding y-positions from enemy_paths
         lane_y_positions = jnp.where(
             updated_lanes < number_lanes,
-            jnp.array(cfg.enemy_paths, dtype=jnp.int32)[updated_lanes],
+            cfg.enemy_paths[updated_lanes],
             - cfg.enemy_height
         )
 
@@ -634,7 +636,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         lane_masks = []
         # iterate through length of enemy_paths (4)
         # lane_mask checks if
-        for i in range(len(jnp.array(cfg.enemy_paths, dtype=jnp.int32))):
+        for i in range(len(cfg.enemy_paths)):
             # For each lane, check if any active enemy is in that lane
             lane_mask = (updated_enemies[:, 4] == i) & flags
             lane_is_occupied = jnp.any(lane_mask)
@@ -751,7 +753,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
     def _handle_cannon_plasma_hit(self, state: AtlantisState) -> AtlantisState:
         # cannon positions (0=left,1=middle,2=right)
-        cx = jnp.array(self.config.cannon_x, dtype=jnp.int32)          # shape (3,)
+        cx = self.config.cannon_x                   # shape (3,)
 
         # which cannon center does the beam line up with?
         raw_hits = (state.plasma_x == cx)           # shape (3,), True for any hit
