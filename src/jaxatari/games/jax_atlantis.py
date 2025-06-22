@@ -993,7 +993,7 @@ def main():
             )
             screen.blit(text_surf, txt_rect)
             pygame.display.flip()
-            pygame.time.delay(2000)  # wait 2 seconds
+            pygame.time.delay(5000)  # wait 5 seconds
             running = False
             continue
 
