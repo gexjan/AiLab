@@ -158,7 +158,7 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
         # add deep blue cannons
         cannon_sprite = _solid_sprite(cfg.cannon_width, cfg.cannon_height, (0, 62, 120))
 
-        @partial(jax.jit, static_argnums=(0,))
+        @partial(jax.jit)
         def _draw_cannon(i, ras):
             alive = state.cannons_alive[i]
             x0 = cfg.cannon_x[i]
