@@ -209,28 +209,35 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
         def _handle_draw_plasma(i, ras):
             # Plasma beam logic
             plasma_color = (0, 255, 255)  # cyan
-            beam_pixel = _solid_sprite(1, 1, plasma_color)
-            plasma_height = cfg.cannon_y
+            cfg = self.config
 
             # only for the one enemy in lane 3 (4th lane) and active
-            # Note that the plasma is deactivated once a cannon is hit, unless it reaches the end of screen.
             on_lane4 = (state.enemies[i, 4] == 3) & (state.enemies[i, 5] == 1)
             may_shoot = state.plasma_allowed[i]
-            ex       = state.enemies[i, 0].astype(jnp.int32) + cfg.enemy_width/2
-            ey       = state.enemies[i, 1].astype(jnp.int32)
-            start_y  = ey + cfg.enemy_height
 
-            # draw vertical line pixel-by-pixel
-            def _draw_row(y, r):
-                return jax.lax.cond(
-                  on_lane4 & (y >= start_y) & may_shoot,
-                  lambda rr: aj.render_at(rr, ex, y, beam_pixel),
-                  lambda rr: rr,
-                  r,
-                )
+            # beam x (center of enemy)
+            ex = state.enemies[i, 0].astype(jnp.int32) + cfg.enemy_width // 2
+            # beam start y (bottom of enemy)
+            start_y = state.enemies[i, 1].astype(jnp.int32) + cfg.enemy_height
+            # beam end y is the cannon’s y
+            end_y = cfg.cannon_y
+            # compute height; clamp at zero so we don’t get negative sizes
+            beam_h = jnp.maximum(end_y - start_y, 0)
 
-            # loop y=0…screen_h−1
-            return jax.lax.fori_loop(0, plasma_height, _draw_row, ras)
+            # build a single vertical sprite of size (1 × beam_h)
+            beam_sprite = _solid_sprite(1, 32, plasma_color)
+
+            def _draw(r):
+                # draw the full beam in one go
+                return aj.render_at(r, ex, start_y, beam_sprite)
+
+            # only render if this enemy is allowed to shoot and there's room
+            return jax.lax.cond(
+                on_lane4 & may_shoot & (beam_h > 0),
+                _draw,
+                lambda r: r,
+                ras,
+            )
 
         # apply to every enemy slot (only one will actually fire)
         raster = jax.lax.fori_loop(0, cfg.max_enemies, _handle_draw_plasma, raster)
