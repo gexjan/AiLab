@@ -28,10 +28,12 @@ class GameConfig:
     bullet_width: int = 1
     bullet_speed: int = 3 #for side cannon 3 in x 2 in y middle 3 in y
     cannon_height: int = 8
-    cannon_width: int = 8
+    cannon_width: int = 4
     cannon_y: int = 160
     cannon_x: jnp.ndarray = field(
-        default_factory=lambda: jnp.array([0,72,152], dtype=jnp.int32)
+        default_factory=lambda: jnp.array(
+            [0, 20, 40, 60, 80, 100, 120, 140, 156], dtype=jnp.int32
+        )
     )
     max_bullets: int = 2
     max_enemies: int = 20  # max 1 per line
@@ -295,7 +297,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             wave_end_cooldown_remaining=jnp.array(0, dtype=jnp.int32),
             plasma_x=jnp.array(-1, dtype=jnp.int32),
             plasma_allowed=jnp.ones((self.config.max_enemies,), dtype=jnp.bool_),
-            cannons_alive=jnp.array([True, True, True], dtype=jnp.bool_)
+            cannons_alive=jnp.ones((self.config.cannon_x.shape[0],), dtype=jnp.bool_)
         )
 
         obs = self._get_observation(new_state)
@@ -327,8 +329,8 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
                 0,
                 jnp.where(
                     action == Action.FIRE,
-                    1,
-                    jnp.where(action == Action.RIGHTFIRE, 2, -1),
+                    4,
+                    jnp.where(action == Action.RIGHTFIRE, 8, -1),
                 ),
             ),
             -1,
@@ -357,7 +359,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
                 cannon_idx == 0,  # true for left cannon
                 cfg.bullet_speed,  # e.g. +3 pixels/frame
                 jnp.where(
-                    cannon_idx == 2,  # true for right cannon
+                    cannon_idx == 8,  # true for right cannon
                     -cfg.bullet_speed,  # e.g. -3 px
                     0,  # zero horizontal velocity
                 ),
@@ -365,7 +367,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
             # vertical component dy:
             # - side bullets move slightly slower up than middle bullet Because origin is in top left, its negative
-            dy = jnp.where(jnp.logical_or(cannon_idx == 0, cannon_idx==2), -(cfg.bullet_speed-1), -cfg.bullet_speed)
+            dy = jnp.where(jnp.logical_or(cannon_idx == 0, cannon_idx==8), -(cfg.bullet_speed-1), -cfg.bullet_speed)
 
             new_bullet = jnp.array(
                 [cfg.cannon_x[cannon_idx], cfg.cannon_y, dx, dy],  # velocity
@@ -751,49 +753,79 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
         return state._replace(plasma_x=plasma_x)
 
+    """
+    Handle an incoming plasma beam from lane-4 enemies:
+
+    • Only cannons at indices 0, 5, and 8 may fire.  
+    • Cannons at 0 and 8 are invulnerable and can never be knocked out.  
+    • On the very first successful alignment of the beam with cannon 4 (the center), 
+      cannon 4 is deactivated.  
+    • After cannon 4 is dead, any subsequent beam that lines up with one of the remaining
+      shootable cannons (indices 1–3 or 5–7) will knock *that* cannon out—still leaving
+      0 and 8 untouched.  
+    • The beam that causes a knockout is then disabled until that enemy walks off‐screen.
+    """
     def _handle_cannon_plasma_hit(self, state: AtlantisState) -> AtlantisState:
-        # cannon positions (0=left,1=middle,2=right)
-        cx = self.config.cannon_x                   # shape (3,)
+        cx = self.config.cannon_x                # shape (9,)
 
-        # which cannon center does the beam line up with?
-        raw_hits = (state.plasma_x == cx)           # shape (3,), True for any hit
+        # 1) Which cannon centers line up with the beam?
+        raw_hits = (state.plasma_x == cx)        # shape (9,)
 
-        # --- 1) figure out which cannon to skip based on spawn side ---
-        # find shooter: the one in lane 4 whose beam_x == plasma_x
-        lane4_mask  = (state.enemies[:, 4] == 3) & (state.enemies[:, 5] == 1)
-        exs         = state.enemies[:, 0] + (self.config.enemy_width // 2)
+        # 2) Who fired the beam?
+        lane4_mask  = (state.enemies[:,4] == 3) & (state.enemies[:,5] == 1)
+        exs         = state.enemies[:,0] + (self.config.enemy_width // 2)
         shooter_idx = jnp.argmax(lane4_mask & (exs == state.plasma_x))
 
-        # check its direction: dx>0 means it came from the left (skip cannon 0),
-        # dx<0 means it came from the right (skip cannon 2)
-        dx          = state.enemies[shooter_idx, 2]
-        skip_idx    = jnp.where(dx > 0, 0, 2)
+        # 3) First-hit logic: only when cannon 4 is still alive *and* aligned
+        fourth_alive = state.cannons_alive[4]
+        align_fourth = state.plasma_x == cx[4]
+        first_hit    = fourth_alive & align_fourth & state.plasma_allowed[shooter_idx]
 
-        # build mask of “real” cannon hits:
-        # – it lines up (raw_hits)
-        # – cannon is still alive (state.cannons_alive)
-        # – it’s *not* the skipped one (skip_idx)
-        idxs        = jnp.arange(cx.shape[0], dtype=jnp.int32)
-        real_hits   = state.plasma_allowed[shooter_idx] & raw_hits & state.cannons_alive & (idxs != skip_idx)
+        # --- helper to kill cannon 4 and disable its plasma ---
+        def kill_fourth(s: AtlantisState) -> AtlantisState:
+            ca = s.cannons_alive.at[4].set(False)
+            pa = s.plasma_allowed.at[shooter_idx].set(False)
+            return s._replace(cannons_alive=ca, plasma_allowed=pa)
 
-        # kill those cannons
-        new_cannons_alive = state.cannons_alive & (~real_hits)
+        # --- helper to knock down the *other* cannons (1–3,5–7) once 4 is gone ---
+        def knock_others(s: AtlantisState) -> AtlantisState:
+            idxs = jnp.arange(cx.shape[0], dtype=jnp.int32)
+            # invulnerable: 0, 4 (already dead), and 8
+            invuln = (idxs == 0) | (idxs == 4) | (idxs == cx.shape[0] - 1)
 
-        # --- 2) only disable plasma from the shooter if it actually hit an alive cannon ---
-        disable_plasma = state.plasma_allowed
-        disable_plasma = jax.lax.cond(
-            jnp.any(real_hits),
-            lambda arr: arr.at[shooter_idx].set(False),
-            lambda arr: arr,
-            disable_plasma,
+            real_hits = (
+                s.plasma_allowed[shooter_idx]
+                & raw_hits
+                & s.cannons_alive
+                & (~invuln)
+            )
+            new_ca = s.cannons_alive & (~real_hits)
+            new_pa = jax.lax.cond(
+                jnp.any(real_hits),
+                lambda arr: arr.at[shooter_idx].set(False),
+                lambda arr: arr,
+                s.plasma_allowed,
+            )
+            return s._replace(cannons_alive=new_ca, plasma_allowed=new_pa)
+
+        # 4) Compose the two-phase logic
+        #    a) if first_hit → kill cannon 4
+        #    b) else if cannon 4 already dead → knock others
+        #    c) otherwise → do nothing
+        return jax.lax.cond(
+            first_hit,
+            kill_fourth,
+            lambda s: jax.lax.cond(
+                ~fourth_alive,
+                knock_others,
+                lambda s2: s2,
+                s
+            ),
+            state
         )
 
-        return state._replace(
-            cannons_alive= new_cannons_alive,
-            plasma_allowed= disable_plasma,
-        )
-
-    # Reactivate plasma after a cannon is hit and the end of screen is reached.
+    # Reactivate plasma once the firing enemy has fully exited the screen.
+    # This ensures that after its beam hits a cannon, the same enemy can fire again only after it has moved off-screen.
     @partial(jax.jit, static_argnums=(0,))
     def _refresh_plasma_allowed(self, state: AtlantisState) -> AtlantisState:
         new_pos = state.enemies[:,0]
@@ -980,8 +1012,9 @@ def main():
             config.screen_height,
         )
 
-        # check for game over (all cannons dead)
-        if not game_over and not bool(jnp.any(curr_state.cannons_alive)):
+        # game over once only two cannons remain alive
+        alive_count = jnp.sum(curr_state.cannons_alive)
+        if not game_over and bool(alive_count == 2):
             game_over = True
             # overlay "GAME OVER"
             text_surf = font.render("GAME OVER", True, (255, 0, 0))
