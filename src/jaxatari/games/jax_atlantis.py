@@ -946,10 +946,10 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             state
         )
         observation = self._get_observation(state)
+        done = self._get_done(state)
+
         info = AtlantisInfo(time=jnp.array(0, dtype=jnp.int32), score=state.score)
         state._replace(reward = state.score - previous_state.score)
-        # done = False  # Never terminates for now
-        done = jnp.where(state.score < 10**GameConfig.max_digits_for_score, False, True)  # if score > max displayable value -> done = true
 
         return observation, state, state.reward, done, info
 
@@ -990,11 +990,27 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         return state.reward
 
     @partial(jax.jit, static_argnums=(0,))
-    def _get_done(self, state: AtlantisState) -> bool:
+    def _get_done(self, state: AtlantisState) -> jnp.bool_:
         """
-        Placeholder done: never terminates.
+        Game is done when:
+         1) Only two cannons remain alive, or
+         2) Score has reached the maximum representable (i.e. max_digits_for_score).
         """
-        return False
+        # 1) Count how many cannons are still alive (JAX integer scalar)
+        alive_count = jnp.sum(state.cannons_alive)
+
+        # 2) Has the score reached the top end?
+        #    If max_digits_for_score=9, then max score = 10**9
+        max_score = 10 ** self.config.max_digits_for_score
+        reached_max_score = state.score >= max_score  # JAX boolean scalar
+
+        # 3) Combine both conditions with a JAX logical_or
+        done = jnp.logical_or(alive_count <= 2, reached_max_score)
+
+        #jax.debug.print("[_get_done] alive_count={} reached_max={} → done={}",
+                        #alive_count, reached_max_score, done)
+
+        return done
 
     def action_space(self) -> spaces.Discrete:
         """Returns the action space for Atlantis.
