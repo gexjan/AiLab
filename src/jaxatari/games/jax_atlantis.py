@@ -16,6 +16,7 @@ from jaxatari.renderers import AtraJaxisRenderer
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 import jaxatari.spaces as spaces
 
+from jax import debug  # TODO Remove Debug import later
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -28,10 +29,12 @@ class GameConfig:
     bullet_width: int = 1
     bullet_speed: int = 3 #for side cannon 3 in x 2 in y middle 3 in y
     cannon_height: int = 8
-    cannon_width: int = 8
+    cannon_width: int = 4
     cannon_y: int = 160
     cannon_x: jnp.ndarray = field(
-        default_factory=lambda: jnp.array([0,72,152], dtype=jnp.int32)
+        default_factory=lambda: jnp.array(
+            [0, 20, 40, 60, 80, 100, 120, 140, 156], dtype=jnp.int32
+        )
     )
     max_bullets: int = 2
     max_enemies: int = 20  # max 1 per line
@@ -85,7 +88,11 @@ class AtlantisState(NamedTuple):
     number_enemies_wave_remaining: chex.Array # number of remaining enemies per wave
     wave_end_cooldown_remaining: chex.Array
     #installations: chex.Array # should store all current installations and their coordinates
-
+    plasma_x: chex.Array # X position of the plasma. Y position is actually not that relevant
+    # shape==(max_enemies,) 1=that slot may draw beam. Plasma is deactivated once a cannon is hit, after that the enemy
+    # should reach the end of the screen until it is reactivated. See _refresh_plasma_allowed for more info.
+    plasma_allowed: chex.Array
+    cannons_alive: chex.Array # shape (3,), one flag per cannon
 
 class AtlantisObservation(NamedTuple):
     score: jnp.ndarray
@@ -163,13 +170,16 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
         # add deep blue cannons
         cannon_sprite = _solid_sprite(cfg.cannon_width, cfg.cannon_height, (0, 62, 120))
 
+        @partial(jax.jit)
         def _draw_cannon(i, ras):
-            return aj.render_at(
-                ras,
-                cfg.cannon_x[i],  # x pos of i-th cannon
-                cfg.cannon_y,  # y-pos
-                cannon_sprite,
-            )
+            alive = state.cannons_alive[i]
+            x0 = cfg.cannon_x[i]
+            y0 = cfg.cannon_y
+
+            def _blit(r):
+                return aj.render_at(r, x0, y0, cannon_sprite)
+
+            return jax.lax.cond(alive, _blit, lambda r: r, ras)
 
         raster = jax.lax.fori_loop(0, cfg.cannon_x.shape[0], _draw_cannon, raster)
 
@@ -232,6 +242,43 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
             num_digits,             # show that many digits
             spacing=digit_w
         )
+        def _handle_draw_plasma(i, ras):
+            # Plasma beam logic
+            plasma_color = (0, 255, 255)  # cyan
+            cfg = self.config
+
+            # only for the one enemy in lane 3 (4th lane) and active
+            on_lane4 = (state.enemies[i, 4] == 3) & (state.enemies[i, 5] == 1)
+            may_shoot = state.plasma_allowed[i]
+
+            # beam x (center of enemy)
+            ex = state.enemies[i, 0].astype(jnp.int32) + cfg.enemy_width // 2
+            # beam start y (bottom of enemy)
+            start_y = state.enemies[i, 1].astype(jnp.int32) + cfg.enemy_height
+            # beam end y is the cannon’s y
+            end_y = cfg.cannon_y
+            # compute height; clamp at zero so we don’t get negative sizes
+            beam_h = jnp.maximum(end_y - start_y, 0)
+
+            # build a single vertical sprite of size (1 × beam_h)
+            beam_sprite = _solid_sprite(1, 32, plasma_color)
+
+            def _draw(r):
+                # draw the full beam in one go
+                return aj.render_at(r, ex, start_y, beam_sprite)
+
+            # only render if this enemy is allowed to shoot and there's room
+            return jax.lax.cond(
+                on_lane4 & may_shoot & (beam_h > 0),
+                _draw,
+                lambda r: r,
+                ras,
+            )
+
+        # apply to every enemy slot (only one will actually fire)
+        raster = jax.lax.fori_loop(0, cfg.max_enemies, _handle_draw_plasma, raster)
+        # ————————————————————————————————
+
         return raster
 
 
@@ -287,12 +334,15 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             command_post_alive=jnp.array(True, dtype=jnp.bool_),
             number_enemies_wave_remaining=jnp.array(self.config.wave_start_enemy_count, dtype=jnp.int32),
             wave_end_cooldown_remaining=jnp.array(0, dtype=jnp.int32),
+            plasma_x=jnp.array(-1, dtype=jnp.int32),
+            plasma_allowed=jnp.ones((self.config.max_enemies,), dtype=jnp.bool_),
+            cannons_alive=jnp.ones((self.config.cannon_x.shape[0],), dtype=jnp.bool_)
         )
 
         obs = self._get_observation(new_state)
         return obs, new_state
 
-    def _interpret_action(self, state, action) -> Tuple[bool, bool, int]:
+    def _interpret_keyboard_action(self, state, action) -> Tuple[bool, bool, int]:
         """
         Translate action into control signals
         Returns three vars:
@@ -318,8 +368,8 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
                 0,
                 jnp.where(
                     action == Action.FIRE,
-                    1,
-                    jnp.where(action == Action.RIGHTFIRE, 2, -1),
+                    4,
+                    jnp.where(action == Action.RIGHTFIRE, 8, -1),
                 ),
             ),
             -1,
@@ -348,7 +398,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
                 cannon_idx == 0,  # true for left cannon
                 cfg.bullet_speed,  # e.g. +3 pixels/frame
                 jnp.where(
-                    cannon_idx == 2,  # true for right cannon
+                    cannon_idx == 8,  # true for right cannon
                     -cfg.bullet_speed,  # e.g. -3 px
                     0,  # zero horizontal velocity
                 ),
@@ -356,7 +406,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
             # vertical component dy:
             # - side bullets move slightly slower up than middle bullet Because origin is in top left, its negative
-            dy = jnp.where(jnp.logical_or(cannon_idx == 0, cannon_idx==2), -(cfg.bullet_speed-1), -cfg.bullet_speed)
+            dy = jnp.where(jnp.logical_or(cannon_idx == 0, cannon_idx==8), -(cfg.bullet_speed-1), -cfg.bullet_speed)
 
             new_bullet = jnp.array(
                 [cfg.cannon_x[cannon_idx], cfg.cannon_y, dx, dy],  # velocity
@@ -373,7 +423,8 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             return jax.lax.cond(slot_available, _write, lambda x: x, s)
 
         # Only attempt the spawn when a cannon actually fired this frame
-        return jax.lax.cond(cannon_idx >= 0, _do_spawn, lambda x: x, state)
+        alive = jnp.where(cannon_idx >= 0, state.cannons_alive[cannon_idx], False)
+        return jax.lax.cond(alive, _do_spawn, lambda x: x, state)
 
     def _update_cooldown(self, state, cannon_idx):
         """Reset after a shot or decrement the fire cooldown timer."""
@@ -754,6 +805,102 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
     def _cooldown_finished(self, state: AtlantisState) -> Array:
         return state.wave_end_cooldown_remaining == 0
 
+    @partial(jax.jit, static_argnums=(0,))
+    def _update_plasma_x_position(self, state: AtlantisState) -> AtlantisState:
+        lane4 = (state.enemies[:, 4] == 3) & (state.enemies[:, 5] == 1)
+        # compute each candidate beam-X (center of enemy)
+        ex = state.enemies[:, 0] + (self.config.enemy_width // 2)
+        # select beam-X for lane4 enemies, else -1
+        beam_xs = jnp.where(lane4, ex, -1)
+        # pick the max (will be -1 if no such enemy)
+        plasma_x = jnp.max(beam_xs)
+        # save into the state
+
+        # Todo remove debug statement after collision logic implemented
+        #debug.print("[DEBUG] plasma_x = {px}", px=plasma_x)
+
+        return state._replace(plasma_x=plasma_x)
+
+    """
+    Handle an incoming plasma beam from lane-4 enemies:
+
+    • Only cannons at indices 0, 5, and 8 may fire.  
+    • Cannons at 0 and 8 are invulnerable and can never be knocked out.  
+    • On the very first successful alignment of the beam with cannon 4 (the center), 
+      cannon 4 is deactivated.  
+    • After cannon 4 is dead, any subsequent beam that lines up with one of the remaining
+      shootable cannons (indices 1–3 or 5–7) will knock *that* cannon out—still leaving
+      0 and 8 untouched.  
+    • The beam that causes a knockout is then disabled until that enemy walks off‐screen.
+    """
+    def _handle_cannon_plasma_hit(self, state: AtlantisState) -> AtlantisState:
+        cx = self.config.cannon_x                # shape (9,)
+
+        # 1) Which cannon centers line up with the beam?
+        raw_hits = (state.plasma_x == cx)        # shape (9,)
+
+        # 2) Who fired the beam?
+        lane4_mask  = (state.enemies[:,4] == 3) & (state.enemies[:,5] == 1)
+        exs         = state.enemies[:,0] + (self.config.enemy_width // 2)
+        shooter_idx = jnp.argmax(lane4_mask & (exs == state.plasma_x))
+
+        # 3) First-hit logic: only when cannon 4 is still alive *and* aligned
+        fourth_alive = state.cannons_alive[4]
+        align_fourth = state.plasma_x == cx[4]
+        first_hit    = fourth_alive & align_fourth & state.plasma_allowed[shooter_idx]
+
+        # --- helper to kill cannon 4 and disable its plasma ---
+        def kill_fourth(s: AtlantisState) -> AtlantisState:
+            ca = s.cannons_alive.at[4].set(False)
+            pa = s.plasma_allowed.at[shooter_idx].set(False)
+            return s._replace(cannons_alive=ca, plasma_allowed=pa)
+
+        # --- helper to knock down the *other* cannons (1–3,5–7) once 4 is gone ---
+        def knock_others(s: AtlantisState) -> AtlantisState:
+            idxs = jnp.arange(cx.shape[0], dtype=jnp.int32)
+            # invulnerable: 0, 4 (already dead), and 8
+            invuln = (idxs == 0) | (idxs == 4) | (idxs == cx.shape[0] - 1)
+
+            real_hits = (
+                s.plasma_allowed[shooter_idx]
+                & raw_hits
+                & s.cannons_alive
+                & (~invuln)
+            )
+            new_ca = s.cannons_alive & (~real_hits)
+            new_pa = jax.lax.cond(
+                jnp.any(real_hits),
+                lambda arr: arr.at[shooter_idx].set(False),
+                lambda arr: arr,
+                s.plasma_allowed,
+            )
+            return s._replace(cannons_alive=new_ca, plasma_allowed=new_pa)
+
+        # 4) Compose the two-phase logic
+        #    a) if first_hit → kill cannon 4
+        #    b) else if cannon 4 already dead → knock others
+        #    c) otherwise → do nothing
+        return jax.lax.cond(
+            first_hit,
+            kill_fourth,
+            lambda s: jax.lax.cond(
+                ~fourth_alive,
+                knock_others,
+                lambda s2: s2,
+                s
+            ),
+            state
+        )
+
+    # Reactivate plasma once the firing enemy has fully exited the screen.
+    # This ensures that after its beam hits a cannon, the same enemy can fire again only after it has moved off-screen.
+    @partial(jax.jit, static_argnums=(0,))
+    def _refresh_plasma_allowed(self, state: AtlantisState) -> AtlantisState:
+        new_pos = state.enemies[:,0]
+        on_screen = (new_pos + self.config.enemy_width > 0) & (new_pos < self.config.screen_width)
+        # whenever *off* screen, re-enable
+        allowed = jnp.where(on_screen, state.plasma_allowed, True)
+        return state._replace(plasma_allowed=allowed)
 
     @partial(jax.jit, static_argnums=(0,))
     def step(
@@ -770,7 +917,7 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
         def _wave_step(s: AtlantisState) -> AtlantisState:
             # input handling
-            fire_pressed, cannon_idx = self._interpret_action(s, action)
+            fire_pressed, cannon_idx = self._interpret_keyboard_action(s, action)
 
             # bullets
             s = self._spawn_bullet(s, cannon_idx)
@@ -783,7 +930,10 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             # motion & collisions
             s = self._move_bullets(s)
             s = self._move_enemies(s)
+            s = self._refresh_plasma_allowed(s)
             s = self._check_bullet_enemy_collision(s)
+            s = self._update_plasma_x_position(s)
+            s = self._handle_cannon_plasma_hit(s)
 
             # check if wave quota exhausted → start pause
             s = self._update_wave(s)
@@ -796,10 +946,10 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             state
         )
         observation = self._get_observation(state)
+        done = self._get_done(state)
+
         info = AtlantisInfo(time=jnp.array(0, dtype=jnp.int32), score=state.score)
         state._replace(reward = state.score - previous_state.score)
-        # done = False  # Never terminates for now 
-        done = jnp.where(state.score < 10**GameConfig.max_digits_for_score, False, True)  # if score > max displayable value -> done = true
 
         return observation, state, state.reward, done, info
 
@@ -840,11 +990,27 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         return state.reward
 
     @partial(jax.jit, static_argnums=(0,))
-    def _get_done(self, state: AtlantisState) -> bool:
+    def _get_done(self, state: AtlantisState) -> jnp.bool_:
         """
-        Placeholder done: never terminates.
+        Game is done when:
+         1) Only two cannons remain alive, or
+         2) Score has reached the maximum representable (i.e. max_digits_for_score).
         """
-        return False
+        # 1) Count how many cannons are still alive (JAX integer scalar)
+        alive_count = jnp.sum(state.cannons_alive)
+
+        # 2) Has the score reached the top end?
+        #    If max_digits_for_score=9, then max score = 10**9
+        max_score = 10 ** self.config.max_digits_for_score
+        reached_max_score = state.score >= max_score  # JAX boolean scalar
+
+        # 3) Combine both conditions with a JAX logical_or
+        done = jnp.logical_or(alive_count <= 2, reached_max_score)
+
+        #jax.debug.print("[_get_done] alive_count={} reached_max={} → done={}",
+                        #alive_count, reached_max_score, done)
+
+        return done
 
     def action_space(self) -> spaces.Discrete:
         """Returns the action space for Atlantis.
@@ -879,6 +1045,8 @@ def get_human_action() -> chex.Array:
 def main():
     config = GameConfig()
     pygame.init()
+    pygame.font.init()
+
     screen = pygame.display.set_mode(
         (
             config.screen_width * config.scaling_factor,
@@ -888,17 +1056,19 @@ def main():
     pygame.display.set_caption("Atlantis")
     clock = pygame.time.Clock()
 
-    game = JaxAtlantis(config=config)
+    # prepare a font for the “GAME OVER” message
+    font = pygame.font.SysFont(None, 48)
 
+    game = JaxAtlantis(config=config)
     renderer = Renderer_AtraJaxis(config=config)
     jitted_step = jax.jit(game.step)
     jitted_reset = jax.jit(game.reset)
 
-    # (curr_state, _) = jitted_reset()
-    (_, curr_state) = jitted_reset()
+    # initial reset
+    _, curr_state = jitted_reset()
 
-    # Game loop
     running = True
+    game_over = False
     frame_by_frame = False
     frameskip = game.frameskip
     counter = 1
@@ -907,30 +1077,22 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_f:
-                    frame_by_frame = not frame_by_frame
-            elif event.type == pygame.KEYDOWN or (
-                event.type == pygame.KEYUP and event.key == pygame.K_n
-            ):
-                if event.key == pygame.K_n and frame_by_frame:
-                    if counter % frameskip == 0:
-                        action = get_human_action()
-                        (obs, curr_state, _, _, _) = jitted_step(curr_state, action)
 
-        if not frame_by_frame:
-            if counter % frameskip == 0:
-                action = get_human_action()
-                (obs, curr_state, _, _, _) = jitted_step(curr_state, action)
-                # print("Enemies remaining:", int(curr_state.number_enemies_wave_remaining))
-                # print("Current wave: ", int(curr_state.wave))
-                # print(f"Timout: {int(curr_state.wave_end_cooldown_remaining)}")
-                # dx_list = curr_state.enemies[:, 2][curr_state.enemies[:, 5] == 1].tolist()
-                # print("Active enemy dx’s:", dx_list)
+            # toggle frame-by-frame mode
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_f:
+                frame_by_frame = not frame_by_frame
 
-        # Render and display
+            # when paused, advance one frame on "N"
+            elif frame_by_frame and event.type == pygame.KEYDOWN and event.key == pygame.K_n:
+                if counter % frameskip == 0 and not game_over:
+                    _, curr_state, _, _, _ = jitted_step(curr_state, get_human_action())
+
+        # if not in frame-by-frame mode, step every frameskip
+        if not frame_by_frame and counter % frameskip == 0 and not game_over:
+            _, curr_state, _, _, _ = jitted_step(curr_state, get_human_action())
+
+        # render
         raster = renderer.render(curr_state)
-
         aj.update_pygame(
             screen,
             raster,
@@ -939,8 +1101,25 @@ def main():
             config.screen_height,
         )
 
+        # game over once only two cannons remain alive
+        alive_count = jnp.sum(curr_state.cannons_alive)
+        if not game_over and bool(alive_count == 2):
+            game_over = True
+            # overlay "GAME OVER"
+            text_surf = font.render("GAME OVER", True, (255, 0, 0))
+            txt_rect = text_surf.get_rect(
+                center=(
+                    (config.screen_width * config.scaling_factor) // 2,
+                    (config.screen_height * config.scaling_factor) // 2,
+                )
+            )
+            screen.blit(text_surf, txt_rect)
+            pygame.display.flip()
+            pygame.time.delay(5000)  # wait 5 seconds
+            running = False
+            continue
+
         counter += 1
-        # FPS
         clock.tick(60)
 
     pygame.quit()
