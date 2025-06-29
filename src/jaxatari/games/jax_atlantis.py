@@ -16,6 +16,7 @@ from jaxatari.renderers import AtraJaxisRenderer
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 import jaxatari.spaces as spaces
 
+from jax import debug
 
 @dataclass(frozen=True)
 class GameConfig:
@@ -96,7 +97,7 @@ class AtlantisState(NamedTuple):
     # columns = [ x,  y,  dx,   type_id, lane, active_flag ]
     #   x, y        → position
     #   dx          → horizontal speed (positive or negative)
-    #   type_id     → integer index into your enemy_specs dict
+    #   type_id     → integer index into enemy_specs dict
     #   lane        → current lane the enemy is on
     #   active_flag → 1 if on-screen, 0 otherwise
     enemies: chex.Array  # shape: (max_enemies, 6)
@@ -113,6 +114,10 @@ class AtlantisState(NamedTuple):
     number_enemies_wave_remaining: chex.Array  # number of remaining enemies per wave
     wave_end_cooldown_remaining: chex.Array
     installations: chex.Array # stores boolean alive
+    plasma_x: chex.Array # X position of the plasma. Y position is actually not that relevant
+    # Plasma is deactivated once a cannon or an installment is hit, after that the enemy
+    # should reach the end of the screen until it is reactivated. See _refresh_plasma_active for more info.
+    plasma_active: chex.Array
 
 class AtlantisObservation(NamedTuple):
     score: jnp.ndarray
@@ -152,9 +157,9 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
         # Backgrounds + Dynamic elements + UI elements
         sprite_names = [
             'enemy_0','enemy_1','enemy_2',
-            'cannon_left', 'cannon_right', 'cannon_middle', 
+            'cannon_left', 'cannon_right', 'cannon_middle',
             'installation_1','installation_2','installation_3',
-            'installation_4','installation_5','installation_6', 
+            'installation_4','installation_5','installation_6',
             'background'
         ]
         for name in sprite_names:
@@ -307,7 +312,41 @@ class Renderer_AtraJaxis(AtraJaxisRenderer):
             num_digits,  # show that many digits
             spacing=digit_w
         )
+
+        # 1) Pre-make two full‐height, static-shape beams:
+        height_upper_beam = 40
+        start_beam = 130
+        beam_light_blue = _solid_sprite(3, height_upper_beam, (90, 204, 165))
+        beam_green = _solid_sprite(3, 50, (61, 151, 60))
+
+        # 2) Helper to stack beams on top of each other
+        def _draw_two_tone_beam(raster, x):
+            r1 = aj.render_at(raster, x, start_beam, beam_light_blue)
+            # then draw yellow from start_y downward (overwrites just the top segment)
+            return aj.render_at(r1, x,  start_beam + height_upper_beam, beam_green)
+
+        # 3) Draw plasma:
+        def _handle_draw_plasma(i, raster):
+            lane = state.enemies[i, 4].astype(jnp.int32)
+            active = state.enemies[i, 5] == 1
+            can_shoot = active & state.plasma_active[i]
+            on_lane4 = lane == 3
+
+            # beam center X to prevent killing command center or installment on first pixel when enemy aligns the installment
+            half_w = jnp.minimum(cfg.enemy_width[i] // 2, 10).astype(jnp.int32)
+            ex = state.enemies[i, 0].astype(jnp.int32) + half_w
+
+            def _draw(r):
+                return _draw_two_tone_beam(r, ex)
+
+            return jax.lax.cond(on_lane4 & can_shoot, _draw, lambda r: r, raster)
+
+        # 5) finally, run it across all enemies
+
+        raster = jax.lax.fori_loop(0, cfg.max_enemies, _handle_draw_plasma, raster)
+
         return raster
+
 
 
 class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInfo]):
@@ -363,6 +402,8 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             number_enemies_wave_remaining=jnp.array(self.config.wave_start_enemy_count, dtype=jnp.int32),
             wave_end_cooldown_remaining=jnp.array(0, dtype=jnp.int32),
             installations= start_installations,
+            plasma_x=jnp.array(-1, dtype=jnp.int32),
+            plasma_active=jnp.ones((self.config.max_enemies,), dtype=jnp.bool_),
         )
 
         obs = self._get_observation(new_state)
@@ -386,6 +427,9 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         # to prevent holding the button down and spamming bullets
         just_pressed = fire_pressed & (~state.fire_button_prev)
         can_shoot = (state.fire_cooldown == 0) & just_pressed
+
+        middle_allowed = jnp.logical_or(action != Action.FIRE, state.command_post_alive)  # false if middle canon used, but already dead
+        can_shoot = can_shoot & middle_allowed
 
         cannon_idx = jnp.where(
             can_shoot,
@@ -578,6 +622,9 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             # Set the direction
             speed = self._sample_speed(rng_speed, s.wave)*cfg.enemy_speed_multipliers[type_id]
             dx = jnp.where(go_left, -speed, speed)
+
+            #debug.print(" Test DX {dx}", dx=dx)
+
             # dx = jnp.where(go_left, -cfg.enemy_speed, cfg.enemy_speed)
 
             # also sets the enemy to be active (last entry is 1)
@@ -588,7 +635,8 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
 
             def _write(write_s):
                 updated_enemies = write_s.enemies.at[slot_idx].set(new_enemy)
-                return write_s._replace(enemies=updated_enemies)
+                p2 = write_s.plasma_active.at[slot_idx].set(True)
+                return write_s._replace(enemies=updated_enemies, plasma_active=p2)
 
             # if enemies still has an empty slot, then write the new enemy
             # otherwise leave the state unchanged
@@ -844,6 +892,146 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         return state.wave_end_cooldown_remaining == 0
 
     @partial(jax.jit, static_argnums=(0,))
+    def _update_plasma_x_position(self, state: AtlantisState) -> AtlantisState:
+        cfg = self.config
+
+        # 1) Which slots are active enemies in lane 4?
+        is_lane4_active = (state.enemies[:, 4] == 3) & (state.enemies[:, 5] == 1)
+
+        # 2) Compute each slot’s beam‐X (center of enemy)
+        type_ids = state.enemies[:, 3].astype(jnp.int32)
+        centers   = state.enemies[:, 0] + (cfg.enemy_width[type_ids] // 2)
+
+        # 3) Zero out non‐lane4 slots by mapping them to -1
+        lane4_centers = jnp.where(is_lane4_active, centers, -1)
+
+        # 4) Pick the one true X (or -1 if none)
+        raw_x = jnp.max(lane4_centers)
+
+        # 5) Clamp into [1, screen_width]
+        clamped_x = jnp.clip(raw_x, 1, cfg.screen_width) #Prevent X from going negative
+
+        #debug.print("[DEBUG] plasma_x = {px}", px=clamped_x)
+
+        return state._replace(plasma_x=clamped_x)
+
+    """
+        Handle an incoming plasma beam from lane-4 enemies:
+        • Cannons left and right are invulnerable and can never be knocked out. Only center command can be shot down.
+        • On the very first successful alignment of the beam with the center command, it is eliminated.
+        • After center command is dead, any subsequent beam that lines up with one of the remaining installments is shot
+        down. The beam that causes a knockout is then disabled until that enemy walks off‐screen.
+        """
+    @partial(jax.jit, static_argnums=0)
+    def _handle_plasma_hit(self, state: AtlantisState) -> AtlantisState:
+        cfg = self.config
+
+        # Which lane-4 enemies can fire this frame?
+        is_lane4 = (state.enemies[:, 4] == 3) & (state.enemies[:, 5] == 1)
+        can_fire = is_lane4 & state.plasma_active
+        shooter_idx = jnp.argmax(can_fire)
+        shooter_fired = jnp.any(can_fire)
+
+        # compute the center‐offset for the beam. 10 pixel puffer so that enemies donot kill on first pixel
+        centers = state.enemies[:, 0] + 10
+
+        # reconstruct old beam‐X by subtracting dx
+        old_centers = centers - state.enemies[:, 2]
+
+        #debug.print(" Old center:  {old} New center: {new}", old=old_centers[0], new=centers[0])
+
+        # Since speed of plasma can change, we need to find a range to check if the canon / installment should
+        # be hit
+        beam_old = jnp.where(can_fire, old_centers, -1)
+        beam_new = jnp.where(can_fire, centers, -1)
+
+        # now find the maximum (i.e. the only) beam among shooters
+        beam_old = jnp.max(beam_old)  # -1 if none
+        beam_new = jnp.max(beam_new)
+
+        # define an inclusive interval [lo, hi]
+        lo = jnp.minimum(beam_old, beam_new)
+        hi = jnp.maximum(beam_old, beam_new)
+
+        # build 7 possible targets
+        cmd_center = cfg.cannon_x[1]
+        inst_centers = cfg.installations_x
+        targets = jnp.sort(jnp.concatenate([jnp.array([cmd_center]), inst_centers], 0))
+
+        # hit if any target lies in [lo,hi]
+        hit_mask = (targets >= lo) & (targets <= hi)
+        any_hit = jnp.any(hit_mask)
+        hit_index = jnp.argmax(hit_mask)  # first match
+
+        # 5) Decide who to kill
+        kill_cmd = shooter_fired & any_hit & (hit_index == 3) & state.command_post_alive
+
+        inst_idx = hit_index - 1  # maps 1→install[0], …, 6→install[5]
+        inst_alive = (inst_idx >= 0) & (inst_idx < inst_centers.shape[0]) & state.installations[inst_idx]
+        kill_inst = shooter_fired & any_hit & (~state.command_post_alive) & inst_alive
+
+        def _handle_hit(s: AtlantisState) -> AtlantisState:
+            # debug info
+            #debug.print("[DEBUG] Targets = {px}", px=state.plasma_active)
+            #debug.print("[DEBUG] Enemies X = {px}", px=state.enemies[:, 0])
+            #debug.print("[DEBUG] Enemies Y = {px}", px=state.enemies[:, 1])
+            #debug.print("[DEBUG] Targets = {px}", px=targets)
+            #debug.print("[DEBUG] Inst = {px}", px=inst_centers)
+
+            #debug.print(
+                #"PLASMA HIT!  hit_index={hit}  inst_idx={ii}  cmd_alive_before={cmd}  shooter_x={sx}  target_x={tx}",
+                #hit=hit_index, ii=inst_idx, cmd=state.command_post_alive, sx=plasma_x, tx=targets[hit_index]
+            #)
+
+            # a) knock out command post
+            s1 = jax.lax.cond(
+                kill_cmd,
+                lambda st: st._replace(command_post_alive=False),
+                lambda st: st,
+                s,
+            )
+
+            # b) knock out the installation
+            def _kill_one(st: AtlantisState) -> AtlantisState:
+                return st._replace(installations=st.installations.at[inst_idx].set(False))
+
+            s2 = jax.lax.cond(
+                kill_inst,
+                _kill_one,
+                lambda st: st,
+                s1,
+            )
+
+            # c) disable this shooter’s plasma if either the command post OR an installation was killed
+            disable_plasma = kill_inst | kill_cmd
+            return jax.lax.cond(
+                disable_plasma,
+                lambda st: st._replace(plasma_active=st.plasma_active.at[shooter_idx].set(False)),
+                lambda st: st,
+                s2,
+            )
+
+        return jax.lax.cond(
+            shooter_fired & any_hit,
+            _handle_hit,
+            lambda st: st,
+            state,
+        )
+
+    @partial(jax.jit, static_argnums=(0,))
+    def _refresh_plasma_active(self, state: AtlantisState) -> AtlantisState:
+        # compute each enemy’s x‐position
+        new_pos = state.enemies[:, 0]
+        # on_screen == True if any part of the enemy is still inside [0, screen_width)
+        on_screen = (
+                (new_pos + self.config.enemy_width[state.enemies[:, 3].astype(jnp.int32)] > 0)
+                & (new_pos < self.config.screen_width)
+        )
+        # whenever *off* screen, re‐enable that slot’s plasma_active bit
+        allowed = jnp.where(on_screen, state.plasma_active, True)
+        return state._replace(plasma_active=allowed)
+
+    @partial(jax.jit, static_argnums=(0,))
     def step(
             self, state: AtlantisState, action: chex.Array
     ) -> Tuple[AtlantisObservation, AtlantisState, float, bool, AtlantisInfo]:
@@ -873,6 +1061,9 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             s = self._move_bullets(s)
             s = self._move_enemies(s)
             s = self._check_bullet_enemy_collision(s)
+            s = self._update_plasma_x_position(s)
+            s = self._refresh_plasma_active(s)
+            s = self._handle_plasma_hit(s)
 
             # check if wave quota exhausted → start pause
             s = self._update_wave(s)
@@ -885,11 +1076,9 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
             state
         )
         observation = self._get_observation(state)
+        done = self._get_done(state)
         info = AtlantisInfo(time=jnp.array(0, dtype=jnp.int32), score=state.score)
         state._replace(reward=state.score - previous_state.score)
-        # done = False  # Never terminates for now
-        done = jnp.where(state.score < 10 ** GameConfig.max_digits_for_score, False,
-                         True)  # if score > max displayable value -> done = true
 
         return observation, state, state.reward, done, info
 
@@ -930,11 +1119,27 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         return state.reward
 
     @partial(jax.jit, static_argnums=(0,))
-    def _get_done(self, state: AtlantisState) -> bool:
+    def _get_done(self, state: AtlantisState) -> jnp.bool_:
         """
-        Placeholder done: never terminates.
+        Game is done when:
+          1) Score has reached the maximum representable (i.e. max_digits_for_score), OR
+          2) The central command post is destroyed and all installations are destroyed.
         """
-        return False
+        # 1) Max‐score condition
+        max_score = 10 ** self.config.max_digits_for_score
+        reached_max = state.score >= max_score  # bool scalar
+
+        # 2) All defenses down?
+        cmd_alive = state.command_post_alive  # bool scalar
+        any_install_alive = jnp.any(state.installations)  # True if at least one installation remains
+        defenses_down = (~cmd_alive) & (~any_install_alive)
+
+        # 3) Final done flag
+        done = reached_max | defenses_down
+
+        #jax.debug.print("[_get_done] score={}|{}  cmd_alive={}  any_inst_alive={}  → done={}", state.score, max_score, cmd_alive, any_install_alive, done)
+
+        return done
 
     def action_space(self) -> spaces.Discrete:
         """Returns the action space for Atlantis.
