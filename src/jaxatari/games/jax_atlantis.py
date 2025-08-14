@@ -948,25 +948,24 @@ class JaxAtlantis(JaxEnvironment[AtlantisState, AtlantisObservation, AtlantisInf
         beam_new = jnp.max(beam_new)
 
         # Build 7 possible targets, 6 installments and one central canon
-        # If enemy comes from left to right, collision occurs when plasma hits the right edge of the installation
-        # If enemy comes from right to left, collision occurs when plasma hits the left edge of the installation
-        # Although, in the real game, the enemy is shot down on first contact, since we don't have the animations right
-        # now, we implemented this extra so that it looks good and real while playing
+        # For proper plasma collision: hit the edge that the plasma encounters FIRST
+        # If enemy comes from left to right (dx > 0), plasma hits the LEFT edge of targets
+        # If enemy comes from right to left (dx < 0), plasma hits the RIGHT edge of targets
 
         dx_shooter = state.enemies[shooter_idx, 2]
         
-        # For installations: hit the approaching edge based on enemy direction
+        # For installations: hit the entry edge based on enemy direction
         inst_targets = jnp.where(
             dx_shooter > 0,  # enemy moving left to right
-            cfg.installations_x + cfg.installations_width,  # hit right edge
-            cfg.installations_x  # hit left edge
+            cfg.installations_x,  # hit left edge (first contact)
+            cfg.installations_x + cfg.installations_width  # hit right edge (first contact)
         )
 
         # Same logic for central cannon
         cmd_target = jnp.where(
             dx_shooter > 0,  # enemy moving left to right
-            cfg.cannon_x[1] + cfg.cannon_width,  # hit right edge
-            cfg.cannon_x[1]  # hit left edge
+            cfg.cannon_x[1],  # hit left edge (first contact)
+            cfg.cannon_x[1] + cfg.cannon_width  # hit right edge (first contact)
         )
 
         targets = jnp.concatenate([jnp.array([cmd_target]), inst_targets], 0)
